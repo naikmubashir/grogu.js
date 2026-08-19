@@ -51,6 +51,7 @@ src/
   app.ts
   utils.ts
   types.ts                  # public authoring contracts
+  grogu-env.d.ts            # optional project type augmentation (see 8.1)
   initTest.ts
   config/
     conf.ts
@@ -156,15 +157,31 @@ mechanical.
 
 ```ts
 import type { Request, Response, NextFunction, RequestHandler } from "express";
+import type apiVersionConfig from "./config/apiVersions";
 
 export type HttpMethod =
   | "all" | "get" | "post" | "put" | "delete"
   | "trace" | "options" | "connect" | "patch" | "head";
 
-/** Augmentable by the consuming project via declaration merging. */
+/**
+ * Accepted casings for a method prefix. Mirrors the case-insensitive regex in
+ * getValidHttpMethod, so "GET", "get" and "Get" all remain valid.
+ */
+export type MethodPrefix =
+  | Uppercase<HttpMethod>
+  | Lowercase<HttpMethod>
+  | Capitalize<HttpMethod>;
+
+/** Either "GET /test" (method in the key) or "/test" (method in the definition). */
+export type RouteKey = `${MethodPrefix} /${string}` | `/${string}`;
+
+/** Derived from config/apiVersions.ts, which is declared `as const`. */
+export type AllowedVersion = (typeof apiVersionConfig)["allowedVersions"][number];
+
+/** Augmentable by the consuming project via declaration merging (see §8.1). */
 export interface ServicesMap { [serviceName: string]: any; }
 
-/** Augmentable by the consuming project via declaration merging. */
+/** Augmentable by the consuming project via declaration merging (see §8.1). */
 export interface GroguConfig {
   CONSTANTS: Record<string, unknown>;
   rootDir: string;
@@ -178,9 +195,9 @@ export interface Dependencies {
 
 export interface RouteDefinition {
   /** Omitted when the method is embedded in the route key, e.g. "GET /test". */
-  method?: string;
-  /** Defaults to apiVersions.default when omitted. */
-  version?: string;
+  method?: MethodPrefix;
+  /** Defaults to apiVersions.default when omitted. Checked against allowedVersions. */
+  version?: AllowedVersion;
   /** Defaults to true. */
   enabled?: boolean;
   /** Names of files in middlewares/; defaults to []. */
@@ -188,7 +205,7 @@ export interface RouteDefinition {
   handler: RequestHandler;
 }
 
-export type RoutesFactory = (deps: Dependencies) => Record<string, RouteDefinition>;
+export type RoutesFactory = (deps: Dependencies) => Record<RouteKey, RouteDefinition>;
 
 export interface ControllerModule {
   routes: RoutesFactory;
@@ -206,12 +223,64 @@ export type GroguMiddleware = (
 
 export interface ApiVersionConfig {
   default: string;
-  allowedVersions: string[];
+  /** readonly, because config/apiVersions.ts is declared `as const`. */
+  allowedVersions: readonly string[];
 }
 ```
 
 `ServicesMap` and `GroguConfig` carry index signatures so untyped projects work out of the box,
 while a project that wants real types can declaration-merge onto them.
+
+Three of these types exist to close gaps where a mistake would otherwise survive compilation and
+fail silently or at boot:
+
+| Type | Catches at compile time | Previously failed |
+|---|---|---|
+| `RouteKey` | `"GTE /test"`, `"GET test"` | silently mounted nothing |
+| `AllowedVersion` | `version: "v9.9"` | `fatalError` at boot |
+| `RouteDefinition` | `handlr:`, `middlewares:` | silently mounted nothing |
+
+`config/apiVersions.ts` is therefore declared `as const` so its literal values survive into the
+type system:
+
+```ts
+export default {
+  default: "v1.0",
+  allowedVersions: ["v1.0", "v2.0"],
+} as const;
+```
+
+**Consequence:** `config/apiVersions.ts` becomes required at compile time, where it was optional
+at runtime. The loader keeps its `existsSync` fallback for robustness, but `src/types.ts` imports
+the file for the `AllowedVersion` union, so deleting it is now a compile error. The file ships
+with the boilerplate, so this affects nobody who has not deliberately removed it.
+
+## 8.1 Project-level type augmentation
+
+`Services.UserService.iDoSomething()` cannot be typed by the framework, because the runtime
+scanner means nothing statically references the service files. A project closes this itself with
+one declaration-merging file, `src/grogu-env.d.ts`:
+
+```ts
+export {}; // makes this file a module, which augmentation requires
+
+declare module "./types" {
+  interface ServicesMap {
+    UserService: Awaited<ReturnType<typeof import("./services/UserService").default>>;
+  }
+  interface GroguConfig {
+    aws: { key: string; secret: string };
+  }
+}
+```
+
+The relative specifier `"./types"` resolves from the containing file, so no `paths` alias and no
+tsconfig change is needed. `import type` is erased at compile time, so this adds no runtime
+coupling and does not disturb the scanner.
+
+This is **opt-in and hand-maintained**. A project that skips it still compiles and runs; it just
+keeps the `any` fallback from the index signatures. Keeping it in sync with the contents of
+`services/` is manual — the codegen approach in §19 is what automates it.
 
 ## 9. Authoring conventions
 
@@ -230,7 +299,7 @@ Example controller:
 import type { RoutesFactory } from "../types";
 import { logger } from "../utils";
 
-export const routes: RoutesFactory = ({ Services, config }) => ({
+export const routes = (({ Services, config }) => ({
   "GET /test": {
     handler: async (req, res) => {
       try {
@@ -241,7 +310,7 @@ export const routes: RoutesFactory = ({ Services, config }) => ({
       }
     },
   },
-});
+})) satisfies RoutesFactory;
 ```
 
 Example service:
@@ -249,12 +318,22 @@ Example service:
 ```ts
 import type { ServiceFactory } from "../types";
 
-const UserService: ServiceFactory = async ({ config, Services }) => ({
+const UserService = (async ({ config, Services }) => ({
   iDoSomething: async () => "hello world",
-});
+})) satisfies ServiceFactory;
 
 export default UserService;
 ```
+
+### Annotate with `satisfies`, never with `:`
+
+`const UserService: ServiceFactory = ...` is **wrong** and must not appear in the codebase or the
+docs. A type annotation makes the declared type win, so `ServiceFactory<T = any>` erases the
+inferred return shape and `Awaited<ReturnType<typeof UserService>>` collapses to `any` — which
+silently defeats the augmentation in §8.1 before it starts.
+
+`satisfies` checks the value against the contract **without widening it**, so the precise object
+shape survives for `ReturnType` to recover. The same rule applies to `routes` and to middlewares.
 
 ## 10. Loader interop normalization
 
@@ -321,6 +400,10 @@ These are existing behavior and port as-is:
   logging a rejection message.
 - Route keys are matched case-insensitively for the method prefix via the existing regex.
 
+One **deliberate narrowing**: `MethodPrefix` admits `GET`, `get` and `Get`, but not arbitrary
+casing such as `gEt`, which the runtime regex would still accept. This trades an unreachable
+edge case for catching real typos in route keys.
+
 ## 14. Tests
 
 `src/tests/` compiles to `dist/tests/`. `initTest.ts` forks `./dist/app`, waits for the `"ready"`
@@ -360,6 +443,11 @@ README additionally documents the new build step and the `src/` → `dist/` layo
    registration step anywhere.
 7. A legacy `module.exports = fn` service file, compiled or dropped in as `.js`, still loads.
 8. No `export =` anywhere in the codebase.
+9. No `: ServiceFactory` / `: RoutesFactory` annotations; contracts are applied with `satisfies`.
+10. `version: "v9.9"`, `"GTE /test"` and `handlr:` each fail `tsc` rather than failing at boot or
+    silently mounting nothing.
+11. Adding `src/grogu-env.d.ts` per §8.1 makes `Services.UserService.iDoSomething()` autocomplete
+    and makes `Servces.UserSevice` a compile error; removing the file still compiles and runs.
 
 ## 18. Risks
 
@@ -369,3 +457,17 @@ README additionally documents the new build step and the `src/` → `dist/` layo
 | Missing `dist/` directories crash boot | Explicit `existsSync` guard, plus acceptance criterion 5 |
 | Default-export unwrapping misses an edge case | Single shared helper with defined precedence; acceptance criterion 7 covers legacy shape |
 | Strict mode tempts broad `any` usage | Escape hatches enumerated in §11; anything beyond those three needs justification |
+
+## 19. Deferred: generated type registry
+
+§8.1 closes the `Services` / `config` typing gap but is hand-maintained and can drift from the
+actual contents of `services/`. The alternative is a codegen step that walks the source
+directories at build time and emits `grogu-env.d.ts` automatically, along with a union of
+middleware names so `localMiddlewares: ["chekAuth"]` becomes a compile error too.
+
+It is purely additive type metadata — no runtime behavior changes, and the drop-a-file
+convention is untouched, since the generator does the bookkeeping instead of the author.
+
+**Status: open, not part of this plan.** Cost is one more build step and one more piece of
+tooling to maintain. The types in §8 are designed so this can be layered on later without
+reworking them: the generator would emit exactly the augmentation shown in §8.1.
