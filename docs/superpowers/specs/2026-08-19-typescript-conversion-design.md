@@ -207,6 +207,16 @@ export interface RouteDefinition {
 
 export type RoutesFactory = (deps: Dependencies) => Record<RouteKey, RouteDefinition>;
 
+/**
+ * Controllers use this helper rather than `satisfies RoutesFactory`.
+ * RouteKey compiles to pattern index signatures, which ignore keys that match no
+ * pattern — so `satisfies` alone lets "GTE /test" through, and skips checking that
+ * value's contents entirely. This validates each key and bans excess properties.
+ */
+export function defineRoutes<T extends Record<string, RouteDefinition>>(
+  factory: (deps: Dependencies) => T & ValidateRoutes<T>
+): (deps: Dependencies) => T;
+
 export interface ControllerModule {
   routes: RoutesFactory;
   globalMiddlewares?: string[];
@@ -239,6 +249,12 @@ fail silently or at boot:
 | `RouteKey` | `"GTE /test"`, `"GET test"` | silently mounted nothing |
 | `AllowedVersion` | `version: "v9.9"` | `fatalError` at boot |
 | `RouteDefinition` | `handlr:`, `middlewares:` | silently mounted nothing |
+
+**All of these require `defineRoutes`.** `satisfies RoutesFactory` does not deliver them: TypeScript
+turns `RouteKey` into pattern index signatures, which constrain keys that match a pattern and
+silently ignore keys that do not. A malformed key therefore escapes, taking the checks on its whole
+value with it. This was found during implementation — the types were correct in isolation but did
+not bind in the position an author actually writes.
 
 `config/apiVersions.ts` is therefore declared `as const` so its literal values survive into the
 type system:
@@ -281,6 +297,26 @@ coupling and does not disturb the scanner.
 This is **opt-in and hand-maintained**. A project that skips it still compiles and runs; it just
 keeps the `any` fallback from the index signatures. Keeping it in sync with the contents of
 `services/` is manual — the codegen approach in §19 is what automates it.
+
+### What augmentation does and does not catch
+
+The index signature and typo detection are mutually exclusive, and the index signature wins:
+
+| Expression | Caught? |
+|---|---|
+| `Services.ExampleService.iDoSomething()` | resolves to `Promise<string>`, not `any` |
+| `Services.ExampleService.iDoSomthing()` | **yes** — the service's own type is concrete |
+| `Services.ExampleServce` | **no** — the index signature answers every unknown key |
+| `config.aws.region` | resolves to `string` |
+
+A misspelled *service name* cannot be caught while `ServicesMap` keeps `[serviceName: string]: any`.
+Removing the fallback would catch it, but would also make every service access an error until the
+project writes its augmentation — which breaks "works out of the box untyped". The fallback is the
+deliberate trade; method-level typos on a known service are still caught, which is where most
+mistakes actually happen.
+
+Codegen (§19) does not change this. It automates writing the augmentation, not the index signature
+trade-off.
 
 ## 9. Authoring conventions
 
@@ -444,10 +480,11 @@ README additionally documents the new build step and the `src/` → `dist/` layo
 7. A legacy `module.exports = fn` service file, compiled or dropped in as `.js`, still loads.
 8. No `export =` anywhere in the codebase.
 9. No `: ServiceFactory` / `: RoutesFactory` annotations; contracts are applied with `satisfies`.
-10. `version: "v9.9"`, `"GTE /test"` and `handlr:` each fail `tsc` rather than failing at boot or
-    silently mounting nothing.
-11. Adding `src/grogu-env.d.ts` per §8.1 makes `Services.UserService.iDoSomething()` autocomplete
-    and makes `Servces.UserSevice` a compile error; removing the file still compiles and runs.
+10. Via `defineRoutes`: `"GTE /test"`, `"GET test"`, `version: "v9.9"`, `handlr:` and `middlewares:`
+    each fail `tsc` rather than failing at boot or silently mounting nothing.
+11. Adding `src/grogu-env.d.ts` per §8.1 makes `Services.ExampleService.iDoSomething()` resolve to
+    `Promise<string>` and makes a misspelled *method* on it a compile error. A misspelled *service
+    name* is not caught — see the table in §8.1. Removing the file still compiles and runs.
 
 ## 18. Risks
 
