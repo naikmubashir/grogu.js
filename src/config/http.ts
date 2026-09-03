@@ -1,35 +1,36 @@
 /**
- * http.js
+ * http.ts
  * Here server level middlewares are defined
  */
-let bodyParser = require("body-parser").json({ limit: "50mb" });
-let compression = require("compression");
-let cors = require("cors");
-/* This whitelist can only filter requests from the browser clients */
-var whitelist = ["http://localhost:3000"];
+import bodyParser from "body-parser";
+import compression from "compression";
+import cors from "cors";
+import type { CorsOptions } from "cors";
+import type { RequestHandler } from "express";
 
-var corsOptions = {
+const jsonParser = bodyParser.json({ limit: "50mb" });
+
+/* This whitelist can only filter requests from the browser clients */
+const whitelist = ["http://localhost:3000"];
+
+const corsOptions: CorsOptions = {
 	origin: function (origin, callback) {
-		// console.log("HTTP Origin given = ", origin);
 		if (!origin) {
-			// console.log("origin undefined")
 			callback(null, true);
 		} else if (whitelist.indexOf(origin) !== -1) {
 			callback(null, true);
 		} else if (origin == null) {
-			// console.log("origin null")
 			callback(null, true);
 		} else if (origin.indexOf("chrome-extension") >= 0) {
 			callback(null, true);
 		} else {
 			console.log("[Not allowed by CORS] but allowed temporarily", origin);
 			callback(null, true);
-			// callback("Not allowed by CORS", false)
-			// callback(new Error("Not allowed by CORS"), false)
 		}
 		return;
 	},
 };
-let corsMiddle = cors(corsOptions);
 
-module.exports = [bodyParser, compression(), corsMiddle];
+const middlewares: RequestHandler[] = [jsonParser, compression(), cors(corsOptions)];
+
+export default middlewares;

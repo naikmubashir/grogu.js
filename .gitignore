@@ -4,3 +4,4 @@ tmp/
 .env.dev
 .env.l2p
 keys/
+dist/
